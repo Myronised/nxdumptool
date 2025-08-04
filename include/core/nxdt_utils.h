@@ -32,10 +32,10 @@ extern "C" {
 #endif
 
 /* Scoped lock macro. */
-#define SCOPED_LOCK(mtx)        for(UtilsScopedLock ANONYMOUS_VARIABLE(scoped_lock) CLEANUP(utilsUnlockScope) = utilsLockScope(mtx); ANONYMOUS_VARIABLE(scoped_lock).cond; ANONYMOUS_VARIABLE(scoped_lock).cond = 0)
+#define SCOPED_LOCK(mtx)        for(UtilsScopedLock ANONYMOUS_VARIABLE(scoped_lock_) CLEANUP(utilsUnlockScope) = utilsLockScope(mtx); ANONYMOUS_VARIABLE(scoped_lock_).cond; ANONYMOUS_VARIABLE(scoped_lock_).cond = 0)
 
 /* Scoped try lock macro. */
-#define SCOPED_TRY_LOCK(mtx)    for(UtilsScopedLock ANONYMOUS_VARIABLE(scoped_lock) CLEANUP(utilsUnlockScope) = utilsTryLockScope(mtx); ANONYMOUS_VARIABLE(scoped_lock).cond; ANONYMOUS_VARIABLE(scoped_lock).cond = 0)
+#define SCOPED_TRY_LOCK(mtx)    for(UtilsScopedLock ANONYMOUS_VARIABLE(scoped_lock_) CLEANUP(utilsUnlockScope) = utilsTryLockScope(mtx); ANONYMOUS_VARIABLE(scoped_lock_).cond; ANONYMOUS_VARIABLE(scoped_lock_).cond = 0)
 
 /// Used by scoped locks.
 typedef struct {
@@ -45,7 +45,7 @@ typedef struct {
 } UtilsScopedLock;
 
 /// Used to determine which CFW is the application running under.
-typedef enum {
+typedef enum : u8 {
     UtilsCustomFirmwareType_Unknown    = 0,
     UtilsCustomFirmwareType_Atmosphere = 1,
     UtilsCustomFirmwareType_SXOS       = 2,
@@ -75,11 +75,11 @@ void utilsCloseResources(void);
 /// Returns a pointer to the application launch path.
 const char *utilsGetLaunchPath(void);
 
-/// Returns the nxlink socket descriptor, or -1 if an nxlink connection couldn't be established.
-int utilsGetNxLinkFileDescriptor(void);
-
 /// Returns a pointer to the FsFileSystem object for the SD card.
 FsFileSystem *utilsGetSdCardFileSystemObject(void);
+
+/// Returns the nxlink socket descriptor, or -1 if an nxlink connection couldn't be established.
+int utilsGetNxLinkFileDescriptor(void);
 
 /// Commits SD card filesystem changes.
 /// Must be used after closing a file handle from the SD card.
@@ -96,8 +96,11 @@ u8 utilsGetAtmosphereKeyGeneration(void);
 /// Fills the provided SdkAddOnVersion element with the target firmware set by Atmosphère.
 void utilsGetAtmosphereTargetFirmware(SdkAddOnVersion *out);
 
-/// Returns a UtilsCustomFirmwareType value.
-u8 utilsGetCustomFirmwareType(void);
+/// Returns true if an emuMMC is being used.
+bool utilsGetAtmosphereEmummcStatus(void);
+
+/// Returns the custom firmware type being used.
+UtilsCustomFirmwareType utilsGetCustomFirmwareType(void);
 
 /// Returns true if the application is running under a Mariko unit.
 bool utilsIsMarikoUnit(void);
@@ -110,9 +113,6 @@ bool utilsIsTerraUnit(void);
 
 /// Returns true if the application is running under applet mode.
 bool utilsIsAppletMode(void);
-
-/// Returns a pointer to the FsStorage object for the eMMC BIS System partition.
-FsStorage *utilsGetEmmcBisSystemPartitionStorage(void);
 
 /// Blocks HOME button presses, disables screen dimming and auto sleep and overclocks system CPU/MEM.
 /// Must be called before starting long-running processes.
@@ -128,10 +128,16 @@ void utilsJoinThread(Thread *thread);
 __attribute__((format(printf, 3, 4))) bool utilsAppendFormattedStringToBuffer(char **dst, size_t *dst_size, const char *fmt, ...);
 
 /// Replaces illegal filesystem characters in the provided NULL-terminated UTF-8 string with underscores ('_').
-/// If 'ascii_only' is set to true, all codepoints outside of the [0x20,0x7F) range will also be replaced with underscores.
+/// If 'ascii_only' is set to true, all codepoints outside of the [0x20,0x7E] range will also be replaced with underscores.
 /// Replacements are performed on a per-codepoint basis, which means the string size in bytes can be reduced by this function.
 /// Furthermore, if multiple, consecutive illegal characters are found, they will all get replaced by a single underscore.
 void utilsReplaceIllegalCharacters(char *str, bool ascii_only);
+
+/// Returns a pointer to a dynamically allocated copy of the provided UTF-8 string with all required characters escaped using another specific character.
+/// 'chars_to_escape' must represent a NULL-terminated character string with all ASCII characters that need to be escaped.
+/// Furthermore, 'escape_char' must represent an ASCII character within the [0x20,0x7E] range.
+/// Returns NULL if an error occurs.
+char *utilsEscapeCharacters(const char *str, const char *chars_to_escape, const char escape_char);
 
 /// Trims whitespace characters from the provided string.
 void utilsTrimString(char *str);
@@ -144,7 +150,7 @@ void utilsGenerateHexString(char *dst, size_t dst_size, const void *src, size_t 
 /// 'src' must match the regex /^(?:[A-Fa-f0-9]{2})+$/.
 /// 'src_size' may be zero, in which case strlen() will be used to determine the length of 'src'. Furthermore, 'src_size' must always be a multiple of 2.
 /// 'dst_size' must be at least 'src_size / 2'.
-/// Returns false if there's an error validating input arguments.
+/// Returns false if there's an error.
 bool utilsParseHexString(void *dst, size_t dst_size, const char *src, size_t src_size);
 
 /// Formats the provided 'size' value to a human-readable size string and stores it in 'dst'.

@@ -29,6 +29,8 @@
 #include <core/cert.h>
 #include <core/usb.h>
 #include <core/devoptab/nxdt_devoptab.h>
+#include <core/system_update.h>
+#include <core/bis_storage.h>
 
 #define BLOCK_SIZE      USB_TRANSFER_BUFFER_SIZE
 #define WAIT_TIME_LIMIT 30
@@ -74,8 +76,8 @@ typedef enum {
     MenuId_BrowseHFS            = 4,
     MenuId_UserTitles           = 5,
     MenuId_UserTitlesSubMenu    = 6,
-    MenuId_NSPTitleTypes        = 7,
-    MenuId_NSP                  = 8,
+    MenuId_NspTitleTypes        = 7,
+    MenuId_Nsp                  = 8,
     MenuId_TicketTitleTypes     = 9,
     MenuId_Ticket               = 10,
     MenuId_NcaTitleTypes        = 11,
@@ -83,7 +85,9 @@ typedef enum {
     MenuId_NcaFsSections        = 13,
     MenuId_NcaFsSectionsSubMenu = 14,
     MenuId_SystemTitles         = 15,
-    MenuId_Count                = 16
+    MenuId_SystemUpdate         = 16,
+    MenuId_BrowseEmmc           = 17,
+    MenuId_Count                = 18
 } MenuId;
 
 typedef struct
@@ -101,6 +105,7 @@ typedef struct
 typedef struct {
     SharedThreadData shared_thread_data;
     u32 xci_crc, full_xci_crc;
+    bool is_t2;
 } XciThreadData;
 
 typedef struct {
@@ -158,6 +163,11 @@ typedef struct {
     const char *base_out_path;
 } FsBrowserHighlightedEntriesThreadData;
 
+typedef struct {
+    SharedThreadData shared_thread_data;
+    SystemUpdateDumpContext *sys_upd_dump_ctx;
+} SystemUpdateThreadData;
+
 /* Function prototypes. */
 
 static void utilsScanPads(void);
@@ -201,11 +211,13 @@ static char *generateOutputLayeredFsFileName(u64 title_id, const char *subdir, c
 
 static bool dumpGameCardSecurityInformation(GameCardSecurityInformation *out);
 
-static bool resetSettings(void *userdata);
-
 static bool saveGameCardImage(void *userdata);
 static bool saveGameCardHeader(void *userdata);
 static bool saveGameCardCardInfo(void *userdata);
+static bool saveGameCardHeader2(void *userdata);
+static bool saveGameCardCardInfo2(void *userdata);
+static bool saveGameCardHeader2Certificate(void *userdata);
+static bool saveGameCardHeader2CertificatePublicKey(void *userdata);
 static bool saveGameCardCertificate(void *userdata);
 static bool saveGameCardInitialData(void *userdata);
 static bool saveGameCardSpecificData(void *userdata);
@@ -226,8 +238,13 @@ static bool saveNintendoContentArchive(void *userdata);
 static bool saveNintendoContentArchiveFsSection(void *userdata);
 static bool browseNintendoContentArchiveFsSection(void *userdata);
 
+static bool saveSystemUpdateDump(void *userdata);
+
+static bool browseEmmcPartition(void *userdata);
+
 static bool fsBrowser(const char *mount_name, const char *base_out_path);
 static bool fsBrowserGetDirEntries(const char *dir_path, FsBrowserEntry **out_entries, u32 *out_entry_count);
+static int fsBrowserDirEntrySortFunction(const void *a, const void *b);
 static bool fsBrowserDumpFile(const char *dir_path, const FsBrowserEntry *entry, const char *base_out_path);
 static bool fsBrowserDumpHighlightedEntries(const char *dir_path, const FsBrowserEntry *entries, u32 entries_count, const char *base_out_path);
 
@@ -255,6 +272,8 @@ static void extractedRomFsReadThreadFunc(void *arg);
 static void fsBrowserFileReadThreadFunc(void *arg);
 static void fsBrowserHighlightedEntriesReadThreadFunc(void *arg);
 static bool fsBrowserHighlightedEntriesReadThreadLoop(SharedThreadData *shared_thread_data, const char *dir_path, const FsBrowserEntry *entries, u32 entries_count, const char *base_out_path, void *buf1, void *buf2);
+
+static void systemUpdateReadThreadFunc(void *arg);
 
 static void genericWriteThreadFunc(void *arg);
 
@@ -312,6 +331,10 @@ static void setNcaFsWriteRawSectionOption(u32 idx);
 
 static u32 getNcaFsUseLayeredFsDirOption(void);
 static void setNcaFsUseLayeredFsDirOption(u32 idx);
+
+static bool resetSettings(void *userdata);
+
+static bool wipeLocalTitleCache(void *userdata);
 
 /* Global variables. */
 
@@ -563,6 +586,34 @@ static MenuElement *g_gameCardMenuElements[] = {
         .userdata = NULL
     },
     &(MenuElement){
+        .str = "dump gamecard header 2 (optional)",
+        .child_menu = NULL,
+        .task_func = &saveGameCardHeader2,
+        .element_options = NULL,
+        .userdata = NULL
+    },
+    &(MenuElement){
+        .str = "dump gamecard cardinfo 2 (optional)",
+        .child_menu = NULL,
+        .task_func = &saveGameCardCardInfo2,
+        .element_options = NULL,
+        .userdata = NULL
+    },
+    &(MenuElement){
+        .str = "dump gamecard header 2 certificate (optional)",
+        .child_menu = NULL,
+        .task_func = &saveGameCardHeader2Certificate,
+        .element_options = NULL,
+        .userdata = NULL
+    },
+    &(MenuElement){
+        .str = "dump gamecard header 2 certificate public key (optional)",
+        .child_menu = NULL,
+        .task_func = &saveGameCardHeader2CertificatePublicKey,
+        .element_options = NULL,
+        .userdata = NULL
+    },
+    &(MenuElement){
         .str = "dump gamecard specific data (optional)",
         .child_menu = NULL,
         .task_func = &saveGameCardSpecificData,
@@ -723,7 +774,7 @@ static MenuElement *g_nspMenuElements[] = {
 };
 
 static Menu g_nspMenu = {
-    .id = MenuId_NSP,
+    .id = MenuId_Nsp,
     .parent = NULL,
     .selected = 0,
     .scroll = 0,
@@ -900,7 +951,7 @@ static MenuElement *g_userTitlesSubMenuElements[] = {
     &(MenuElement){
         .str = "nsp dump options",
         .child_menu = &(Menu){
-            .id = MenuId_NSPTitleTypes,
+            .id = MenuId_NspTitleTypes,
             .parent = NULL,
             .selected = 0,
             .scroll = 0,
@@ -966,6 +1017,56 @@ static Menu g_systemTitlesMenu = {
     .elements = NULL
 };
 
+static MenuElement *g_dumpSystemUpdateMenuElements[] = {
+    &(MenuElement){
+        .str = "start dump",
+        .child_menu = NULL,
+        .task_func = &saveSystemUpdateDump,
+        .element_options = NULL,
+        .userdata = NULL
+    },
+    &g_storageMenuElement,
+    NULL
+};
+
+static u8 g_emmcProdinfofPartition = FsBisPartitionId_CalibrationFile;
+static u8 g_emmcSafePartition = FsBisPartitionId_SafeMode;
+static u8 g_emmcUserPartition = FsBisPartitionId_User;
+static u8 g_emmcSystemPartition = FsBisPartitionId_System;
+
+static MenuElement *g_emmcBrowseMenuElements[] = {
+    &(MenuElement){
+        .str = "browse prodinfof emmc partition",
+        .child_menu = NULL,
+        .task_func = &browseEmmcPartition,
+        .element_options = NULL,
+        .userdata = &g_emmcProdinfofPartition
+    },
+    &(MenuElement){
+        .str = "browse safe emmc partition",
+        .child_menu = NULL,
+        .task_func = &browseEmmcPartition,
+        .element_options = NULL,
+        .userdata = &g_emmcSafePartition
+    },
+    &(MenuElement){
+        .str = "browse user emmc partition",
+        .child_menu = NULL,
+        .task_func = &browseEmmcPartition,
+        .element_options = NULL,
+        .userdata = &g_emmcUserPartition
+    },
+    &(MenuElement){
+        .str = "browse system mmc partition",
+        .child_menu = NULL,
+        .task_func = &browseEmmcPartition,
+        .element_options = NULL,
+        .userdata = &g_emmcSystemPartition
+    },
+    &g_storageMenuElement,
+    NULL
+};
+
 static MenuElement *g_rootMenuElements[] = {
     &(MenuElement){
         .str = "gamecard menu",
@@ -995,9 +1096,42 @@ static MenuElement *g_rootMenuElements[] = {
         .userdata = NULL
     },
     &(MenuElement){
+        .str = "dump system update",
+        .child_menu = &(Menu){
+            .id = MenuId_SystemUpdate,
+            .parent = NULL,
+            .selected = 0,
+            .scroll = 0,
+            .elements = g_dumpSystemUpdateMenuElements
+        },
+        .task_func = NULL,
+        .element_options = NULL,
+        .userdata = NULL
+    },
+    &(MenuElement){
+        .str = "browse emmc partitions",
+        .child_menu = &(Menu){
+            .id = MenuId_BrowseEmmc,
+            .parent = NULL,
+            .selected = 0,
+            .scroll = 0,
+            .elements = g_emmcBrowseMenuElements
+        },
+        .task_func = NULL,
+        .element_options = NULL,
+        .userdata = NULL
+    },
+    &(MenuElement){
         .str = "reset settings",
         .child_menu = NULL,
         .task_func = &resetSettings,
+        .element_options = NULL,
+        .userdata = NULL
+    },
+    &(MenuElement){
+        .str = "wipe local title cache (nxtc.bin)",
+        .child_menu = NULL,
+        .task_func = &wipeLocalTitleCache,
         .element_options = NULL,
         .userdata = NULL
     },
@@ -1024,6 +1158,12 @@ int main(int argc, char *argv[])
 
     int ret = EXIT_SUCCESS;
 
+    consoleInit(NULL);
+
+    consoleClear();
+    consolePrint("please wait...");
+    consoleRefresh();
+
     if (!utilsInitializeResources())
     {
         ret = EXIT_FAILURE;
@@ -1035,8 +1175,6 @@ int main(int argc, char *argv[])
     /* Individual Joy-Cons not supported. */
     padConfigureInput(8, HidNpadStyleSet_NpadFullCtrl);
     padInitializeWithMask(&g_padState, 0x1000000FFUL);
-
-    consoleInit(NULL);
 
     updateStorageList();
 
@@ -1066,7 +1204,7 @@ int main(int argc, char *argv[])
             u32 child_id = selected_element->child_menu->id;
 
             g_titleTypesMenuElements[0]->child_menu = g_titleTypesMenuElements[1]->child_menu = \
-            g_titleTypesMenuElements[2]->child_menu = g_titleTypesMenuElements[3]->child_menu = (child_id == MenuId_NSPTitleTypes ? &g_nspMenu : \
+            g_titleTypesMenuElements[2]->child_menu = g_titleTypesMenuElements[3]->child_menu = (child_id == MenuId_NspTitleTypes ? &g_nspMenu : \
                                                                                                 (child_id == MenuId_TicketTitleTypes ? &g_ticketMenu : \
                                                                                                 (child_id == MenuId_NcaTitleTypes ? &g_ncaMenu : NULL)));
         }
@@ -1077,6 +1215,7 @@ int main(int argc, char *argv[])
         consolePrint("______________________________\n\n");
         if (cur_menu->parent) consolePrint("press b to go back\n");
         if (g_umsDeviceCount) consolePrint("press x to safely remove all ums devices\n");
+        if ((cur_menu->id == MenuId_UserTitles || cur_menu->id == MenuId_SystemTitles) && element_count) consolePrint("press y to dump csv with title info to the sd card\n");
         consolePrint("use the sticks to scroll faster\n");
         consolePrint("press + to exit\n");
         consolePrint("______________________________\n\n");
@@ -1094,14 +1233,14 @@ int main(int argc, char *argv[])
             if (!is_system)
             {
                 consolePrint("title info:\n\n");
-                consolePrint("name: %s\n", app_metadata->lang_entry.name);
-                consolePrint("publisher: %s\n", app_metadata->lang_entry.author);
-                if (cur_menu->id == MenuId_UserTitlesSubMenu || cur_menu->id == MenuId_NSPTitleTypes || cur_menu->id == MenuId_TicketTitleTypes || \
+                consolePrint("name: %s\n", app_metadata->name);
+                consolePrint("publisher: %s\n", app_metadata->publisher);
+                if (cur_menu->id == MenuId_UserTitlesSubMenu || cur_menu->id == MenuId_NspTitleTypes || cur_menu->id == MenuId_TicketTitleTypes || \
                     cur_menu->id == MenuId_NcaTitleTypes) consolePrint("title id: %016lX\n", app_metadata->title_id);
                 consolePrint("______________________________\n\n");
             }
 
-            if (cur_menu->id == MenuId_NSP || cur_menu->id == MenuId_Ticket || cur_menu->id == MenuId_Nca || \
+            if (cur_menu->id == MenuId_Nsp || cur_menu->id == MenuId_Ticket || cur_menu->id == MenuId_Nca || \
                 cur_menu->id == MenuId_NcaFsSections || cur_menu->id == MenuId_NcaFsSectionsSubMenu)
             {
                 if (cur_menu->id != MenuId_NcaFsSections && cur_menu->id != MenuId_NcaFsSectionsSubMenu && (title_info->previous || title_info->next))
@@ -1112,7 +1251,7 @@ int main(int argc, char *argv[])
                 }
 
                 consolePrint("selected title info:\n\n");
-                if (is_system) consolePrint("name: %s\n", app_metadata->lang_entry.name);
+                if (is_system) consolePrint("name: %s\n", app_metadata->name);
                 consolePrint("title id: %016lX\n", title_info->meta_key.id);
                 consolePrint("type: %s\n", titleGetNcmContentMetaTypeName(title_info->meta_key.type));
                 consolePrint("source storage: %s\n", titleGetNcmStorageIdName(title_info->storage_id));
@@ -1122,7 +1261,7 @@ int main(int argc, char *argv[])
                 consolePrint("size: %s\n", title_info->size_str);
                 consolePrint("______________________________\n\n");
 
-                if (cur_menu->id == MenuId_NSP) g_nspMenuElements[0]->userdata = title_info;
+                if (cur_menu->id == MenuId_Nsp) g_nspMenuElements[0]->userdata = title_info;
 
                 if (cur_menu->id == MenuId_Ticket) g_ticketMenuElements[0]->userdata = title_info;
 
@@ -1244,7 +1383,7 @@ int main(int argc, char *argv[])
                     error = !titleGetUserApplicationData(app_metadata->title_id, &user_app_data);
                     if (error) consolePrint("\nfailed to get user application data for %016lX!\n", app_metadata->title_id);
                 } else
-                if (child_menu->id == MenuId_NSP || child_menu->id == MenuId_Ticket || child_menu->id == MenuId_Nca)
+                if (child_menu->id == MenuId_Nsp || child_menu->id == MenuId_Ticket || child_menu->id == MenuId_Nca)
                 {
                     u32 title_type = (cur_menu->id != MenuId_SystemTitles ? *((u32*)selected_element->userdata) : NcmContentMetaType_Unknown);
 
@@ -1264,7 +1403,7 @@ int main(int argc, char *argv[])
                             break;
                         default:
                             /* Get TitleInfo element on demand. */
-                            title_info = titleGetInfoFromStorageByTitleId(NcmStorageId_BuiltInSystem, app_metadata->title_id);
+                            title_info = titleGetTitleInfoEntryFromStorageByTitleId(NcmStorageId_BuiltInSystem, app_metadata->title_id);
                             break;
                     }
 
@@ -1343,7 +1482,7 @@ int main(int argc, char *argv[])
                     break;
                 }
 
-                if ((cur_menu->id == MenuId_NcaFsSectionsSubMenu && cur_menu->selected == 1) || cur_menu->id == MenuId_BrowseHFS)
+                if ((cur_menu->id == MenuId_NcaFsSectionsSubMenu && cur_menu->selected == 1) || cur_menu->id == MenuId_BrowseHFS || cur_menu->id == MenuId_BrowseEmmc)
                 {
                     show_button_prompt = false;
 
@@ -1371,6 +1510,9 @@ int main(int argc, char *argv[])
                     }
 
                     utilsSetLongRunningProcessState(false);
+                } else {
+                    /* Ignore result. */
+                    selected_element->task_func(selected_element->userdata);
                 }
 
                 if (g_appletStatus && show_button_prompt)
@@ -1473,12 +1615,12 @@ int main(int argc, char *argv[])
                 g_titleTypesMenuElements[0]->child_menu = g_titleTypesMenuElements[1]->child_menu = \
                 g_titleTypesMenuElements[2]->child_menu = g_titleTypesMenuElements[3]->child_menu = NULL;
             } else
-            if (cur_menu->id == MenuId_NSPTitleTypes || cur_menu->id == MenuId_TicketTitleTypes || cur_menu->id == MenuId_NcaTitleTypes)
+            if (cur_menu->id == MenuId_NspTitleTypes || cur_menu->id == MenuId_TicketTitleTypes || cur_menu->id == MenuId_NcaTitleTypes)
             {
                 title_info = NULL;
                 title_info_idx = title_info_count = 0;
             } else
-            if (cur_menu->id == MenuId_NSP)
+            if (cur_menu->id == MenuId_Nsp)
             {
                 g_nspMenuElements[0]->userdata = NULL;
             } else
@@ -1513,13 +1655,50 @@ int main(int argc, char *argv[])
             for(u32 i = 0; i < g_umsDeviceCount; i++) umsUnmountDevice(&(g_umsDevices[i]));
             updateStorageList();
         } else
-        if (((btn_down & (HidNpadButton_L)) || (btn_held & HidNpadButton_ZL)) && (cur_menu->id == MenuId_NSP || cur_menu->id == MenuId_Ticket || cur_menu->id == MenuId_Nca) && title_info->previous)
+        if ((btn_down & HidNpadButton_Y) && (cur_menu->id == MenuId_UserTitles || cur_menu->id == MenuId_SystemTitles) && element_count)
+        {
+            consoleClear();
+            consolePrint("dumping title info to csv, please wait...\n");
+            consoleRefresh();
+
+            sprintf(path, DEVOPTAB_SDMC_DEVICE "/" OUTDIR "/%s_title_records.csv", cur_menu->id == MenuId_UserTitles ? "user" : "system");
+
+            char *csv_buf = NULL;
+            size_t csv_buf_size = 0;
+            u32 proc_title_cnt = 0;
+
+            csv_buf = titleGenerateTitleRecordsCsv(&csv_buf_size, &proc_title_cnt, cur_menu->id == MenuId_SystemTitles, false);
+            if (csv_buf)
+            {
+                utilsCreateDirectoryTree(path, false);
+
+                FILE *csv_fd = fopen(path, "wb");
+                if (csv_fd)
+                {
+                    fwrite(UTF8_BOM, 1, strlen(UTF8_BOM), csv_fd);
+                    fwrite(csv_buf, 1, csv_buf_size, csv_fd);
+                    fclose(csv_fd);
+
+                    consolePrint("title info dumped to \"%s\". %u title record(s) processed.\n", path, proc_title_cnt);
+                } else {
+                    consolePrint("failed to open \"%s\" for writing\n", path);
+                }
+
+                free(csv_buf);
+            } else {
+                consolePrint("failed to generate csv data\n");
+            }
+
+            consolePrint("press any button to go back");
+            utilsWaitForButtonPress(0);
+        } else
+        if (((btn_down & (HidNpadButton_L)) || (btn_held & HidNpadButton_ZL)) && (cur_menu->id == MenuId_Nsp || cur_menu->id == MenuId_Ticket || cur_menu->id == MenuId_Nca) && title_info->previous)
         {
             title_info = title_info->previous;
             title_info_idx--;
             switchNcaListTitle(&cur_menu, &element_count, title_info);
         } else
-        if (((btn_down & (HidNpadButton_R)) || (btn_held & HidNpadButton_ZR)) && (cur_menu->id == MenuId_NSP || cur_menu->id == MenuId_Ticket || cur_menu->id == MenuId_Nca) && title_info->next)
+        if (((btn_down & (HidNpadButton_R)) || (btn_held & HidNpadButton_ZR)) && (cur_menu->id == MenuId_Nsp || cur_menu->id == MenuId_Ticket || cur_menu->id == MenuId_Nca) && title_info->next)
         {
             title_info = title_info->next;
             title_info_idx++;
@@ -1798,7 +1977,7 @@ void updateTitleList(Menu *menu, Menu *submenu, bool is_system)
             if (!elements[idx]) continue;
         }
 
-        elements[idx]->str = cur_app_metadata->lang_entry.name;
+        elements[idx]->str = cur_app_metadata->name;
         elements[idx]->child_menu = submenu;
         elements[idx]->userdata = cur_app_metadata;
 
@@ -2010,7 +2189,7 @@ void updateNcaFsSectionsList(NcaUserData *nca_user_data)
 
     /* Initialize NCA context. */
     g_ncaFsSectionsMenuCtx = calloc(1, sizeof(NcaContext));
-    if (!ncaInitializeContext(g_ncaFsSectionsMenuCtx, title_info->storage_id, (title_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : 0), \
+    if (!ncaInitializeContext(g_ncaFsSectionsMenuCtx, title_info->storage_id, (title_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : HashFileSystemPartitionType_None), \
                               &(title_info->meta_key), content_info, NULL)) return;
 
     /* Generate menu elements. */
@@ -2204,6 +2383,9 @@ static bool waitForGameCard(void)
             break;
         case GameCardStatus_LotusAsicFirmwareUpdateRequired:
             consolePrint("gamecard controller firmware update required, please update your console\n");
+            break;
+        case GameCardStatus_OunceGameCardInserted:
+            consolePrint("switch 2 gamecard detected, please take it out and use switch 1 or\nswitch 2 edition gamecards only\n");
             break;
         case GameCardStatus_InsertedAndInfoNotLoaded:
             consolePrint("unexpected I/O error occurred, please check the logfile\n");
@@ -2426,26 +2608,12 @@ static bool dumpGameCardSecurityInformation(GameCardSecurityInformation *out)
     return true;
 }
 
-static bool resetSettings(void *userdata)
-{
-    consolePrint("are you sure you want to reset all settings to their default values?\n");
-    consolePrint("press a to proceed, or b to cancel\n\n");
-
-    u64 btn_down = utilsWaitForButtonPress(HidNpadButton_A | HidNpadButton_B);
-    if (btn_down & HidNpadButton_A)
-    {
-        configResetSettings();
-        consolePrint("settings successfully reset\n");
-    }
-
-    return false;
-}
-
 static bool saveGameCardImage(void *userdata)
 {
     NX_IGNORE_ARG(userdata);
 
     u64 gc_size = 0, free_space = 0;
+    char size_str[16] = {0};
 
     u32 key_area_crc = 0;
     GameCardKeyArea gc_key_area = {0};
@@ -2457,7 +2625,9 @@ static bool saveGameCardImage(void *userdata)
     char *filename = NULL;
     u32 dev_idx = g_storageMenuElementOption.selected;
 
-    bool prepend_key_area = (bool)getGameCardPrependKeyAreaOption();
+    gamecardIsT2(&(xci_thread_data.is_t2));
+
+    bool prepend_key_area = (!xci_thread_data.is_t2 && (bool)getGameCardPrependKeyAreaOption());
     bool keep_certificate = (bool)getGameCardKeepCertificateOption();
     bool trim_dump = (bool)getGameCardTrimDumpOption();
     bool calculate_checksum = (bool)getGameCardCalculateChecksumOption();
@@ -2474,7 +2644,8 @@ static bool saveGameCardImage(void *userdata)
 
     shared_thread_data->total_size = gc_size;
 
-    consolePrint("gamecard size: 0x%lX\n", gc_size);
+    utilsGenerateFormattedSizeString((double)gc_size, size_str, sizeof(size_str));
+    consolePrint("gamecard size: 0x%lX (%s)\n", gc_size, size_str);
 
     if (prepend_key_area)
     {
@@ -2490,11 +2661,12 @@ static bool saveGameCardImage(void *userdata)
             xci_thread_data.full_xci_crc = key_area_crc;
         }
 
-        consolePrint("gamecard size (with key area): 0x%lX\n", gc_size);
+        utilsGenerateFormattedSizeString((double)gc_size, size_str, sizeof(size_str));
+        consolePrint("gamecard size (with key area): 0x%lX (%s)\n", gc_size, size_str);
     }
 
     snprintf(path, MAX_ELEMENTS(path), " [%s][%s][%s].xci", prepend_key_area ? "KA" : "NKA", keep_certificate ? "C" : "NC", trim_dump ? "T" : "NT");
-    filename = generateOutputGameCardFileName("Gamecard", path, true);
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
     if (!filename) goto end;
 
     if (dev_idx == 1)
@@ -2619,7 +2791,7 @@ static bool saveGameCardHeader(void *userdata)
     crc = crc32Calculate(&gc_header, sizeof(GameCardHeader));
     snprintf(path, MAX_ELEMENTS(path), " (Header) (%08X).bin", crc);
 
-    filename = generateOutputGameCardFileName("Gamecard", path, true);
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
     if (!filename) goto end;
 
     if (!saveFileData(filename, &gc_header, sizeof(GameCardHeader))) goto end;
@@ -2653,7 +2825,7 @@ static bool saveGameCardCardInfo(void *userdata)
     crc = crc32Calculate(&gc_cardinfo, sizeof(GameCardInfo));
     snprintf(path, MAX_ELEMENTS(path), " (CardInfo) (%08X).bin", crc);
 
-    filename = generateOutputGameCardFileName("Gamecard", path, true);
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
     if (!filename) goto end;
 
     if (!saveFileData(filename, &gc_cardinfo, sizeof(GameCardInfo))) goto end;
@@ -2667,14 +2839,185 @@ end:
     return success;
 }
 
+static bool saveGameCardHeader2(void *userdata)
+{
+    NX_IGNORE_ARG(userdata);
+
+    GameCardHeader2 gc_header_2 = {0};
+    bool is_t2 = false, success = false;
+    u32 crc = 0;
+    char *filename = NULL;
+
+    gamecardIsT2(&is_t2);
+
+    if (!is_t2)
+    {
+        consolePrint("header 2 areas are unavailable in t1 gamecards!\n");
+        return false;
+    }
+
+    if (!gamecardGetHeader2(&gc_header_2))
+    {
+        consolePrint("failed to get gamecard header 2\n");
+        goto end;
+    }
+
+    consolePrint("get gamecard header 2 ok\n");
+
+    crc = crc32Calculate(&gc_header_2, sizeof(GameCardHeader2));
+    snprintf(path, MAX_ELEMENTS(path), " (Header2) (%08X).bin", crc);
+
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
+    if (!filename) goto end;
+
+    if (!saveFileData(filename, &gc_header_2, sizeof(GameCardHeader2))) goto end;
+
+    consolePrint("successfully saved header 2 as \"%s\"\n", filename);
+    success = true;
+
+end:
+    if (filename) free(filename);
+
+    return success;
+}
+
+static bool saveGameCardCardInfo2(void *userdata)
+{
+    NX_IGNORE_ARG(userdata);
+
+    GameCardInfo2 gc_cardinfo_2 = {0};
+    bool is_t2 = false, success = false;
+    u32 crc = 0;
+    char *filename = NULL;
+
+    gamecardIsT2(&is_t2);
+
+    if (!is_t2)
+    {
+        consolePrint("header 2 areas are unavailable in t1 gamecards!\n");
+        return false;
+    }
+
+    if (!gamecardGetPlaintextCardInfo2Area(&gc_cardinfo_2))
+    {
+        consolePrint("failed to get gamecard cardinfo 2\n");
+        goto end;
+    }
+
+    consolePrint("get gamecard cardinfo 2 ok\n");
+
+    crc = crc32Calculate(&gc_cardinfo_2, sizeof(GameCardInfo2));
+    snprintf(path, MAX_ELEMENTS(path), " (CardInfo2) (%08X).bin", crc);
+
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
+    if (!filename) goto end;
+
+    if (!saveFileData(filename, &gc_cardinfo_2, sizeof(GameCardInfo2))) goto end;
+
+    consolePrint("successfully saved cardinfo 2 dump as \"%s\"\n", filename);
+    success = true;
+
+end:
+    if (filename) free(filename);
+
+    return success;
+}
+
+static bool saveGameCardHeader2Certificate(void *userdata)
+{
+    NX_IGNORE_ARG(userdata);
+
+    GameCardHeader2Certificate gc_header_2_cert = {0};
+    bool is_t2 = false, success = false;
+    u32 crc = 0;
+    char *filename = NULL;
+
+    gamecardIsT2(&is_t2);
+
+    if (!is_t2)
+    {
+        consolePrint("header 2 areas are unavailable in t1 gamecards!\n");
+        return false;
+    }
+
+    if (!gamecardGetHeader2Certificate(&gc_header_2_cert))
+    {
+        consolePrint("failed to get gamecard header 2 certificate\n");
+        goto end;
+    }
+
+    consolePrint("get gamecard header 2 certificate ok\n");
+
+    crc = crc32Calculate(&gc_header_2_cert, sizeof(GameCardHeader2Certificate));
+    snprintf(path, MAX_ELEMENTS(path), " (Header2Certificate) (%08X).bin", crc);
+
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
+    if (!filename) goto end;
+
+    if (!saveFileData(filename, &gc_header_2_cert, sizeof(GameCardHeader2Certificate))) goto end;
+
+    consolePrint("successfully saved header 2 certificate dump as \"%s\"\n", filename);
+    success = true;
+
+end:
+    if (filename) free(filename);
+
+    return success;
+}
+
+static bool saveGameCardHeader2CertificatePublicKey(void *userdata)
+{
+    NX_IGNORE_ARG(userdata);
+
+    u8 gc_header_2_cert_pub_key[0x100] = {0};
+    bool is_t2 = false, success = false;
+    u32 crc = 0;
+    char *filename = NULL;
+
+    gamecardIsT2(&is_t2);
+
+    if (!is_t2)
+    {
+        consolePrint("header 2 areas are unavailable in t1 gamecards!\n");
+        return false;
+    }
+
+    if (!gamecardGetHeader2CertificatePublicKey(gc_header_2_cert_pub_key))
+    {
+        consolePrint("failed to get gamecard header 2 certificate public key\n");
+        goto end;
+    }
+
+    consolePrint("get gamecard header 2 certificate public key ok\n");
+
+    crc = crc32Calculate(gc_header_2_cert_pub_key, sizeof(gc_header_2_cert_pub_key));
+    snprintf(path, MAX_ELEMENTS(path), " (Header2CertificatePubKey) (%08X).bin", crc);
+
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
+    if (!filename) goto end;
+
+    if (!saveFileData(filename, gc_header_2_cert_pub_key, sizeof(gc_header_2_cert_pub_key))) goto end;
+
+    consolePrint("successfully saved header 2 certificate public key dump as \"%s\"\n", filename);
+    success = true;
+
+end:
+    if (filename) free(filename);
+
+    return success;
+}
+
 static bool saveGameCardCertificate(void *userdata)
 {
     NX_IGNORE_ARG(userdata);
 
     FsGameCardCertificate gc_cert = {0};
-    bool success = false;
+    bool is_t2 = false, success = false;
+    size_t cert_size = 0;
     u32 crc = 0;
     char *filename = NULL;
+
+    gamecardIsT2(&is_t2);
 
     if (!gamecardGetCertificate(&gc_cert))
     {
@@ -2684,13 +3027,15 @@ static bool saveGameCardCertificate(void *userdata)
 
     consolePrint("get gamecard certificate ok\n");
 
-    crc = crc32Calculate(&gc_cert, sizeof(FsGameCardCertificate));
+    cert_size = GAMECARD_CERT_SIZE(is_t2);
+
+    crc = crc32Calculate(&gc_cert, cert_size);
     snprintf(path, MAX_ELEMENTS(path), " (Certificate) (%08X).bin", crc);
 
-    filename = generateOutputGameCardFileName("Gamecard", path, true);
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
     if (!filename) goto end;
 
-    if (!saveFileData(filename, &gc_cert, sizeof(FsGameCardCertificate))) goto end;
+    if (!saveFileData(filename, &gc_cert, cert_size)) goto end;
 
     consolePrint("successfully saved certificate as \"%s\"\n", filename);
     success = true;
@@ -2706,16 +3051,24 @@ static bool saveGameCardInitialData(void *userdata)
     NX_IGNORE_ARG(userdata);
 
     GameCardSecurityInformation gc_security_information = {0};
-    bool success = false;
+    bool is_t2 = false, success = false;
     u32 crc = 0;
     char *filename = NULL;
+
+    gamecardIsT2(&is_t2);
+
+    if (is_t2)
+    {
+        consolePrint("initial data areas are unavailable in t2 gamecards!\n");
+        return false;
+    }
 
     if (!dumpGameCardSecurityInformation(&gc_security_information)) goto end;
 
     crc = crc32Calculate(&(gc_security_information.initial_data), sizeof(GameCardInitialData));
     snprintf(path, MAX_ELEMENTS(path), " (Initial Data) (%08X).bin", crc);
 
-    filename = generateOutputGameCardFileName("Gamecard", path, true);
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
     if (!filename) goto end;
 
     if (!saveFileData(filename, &(gc_security_information.initial_data), sizeof(GameCardInitialData))) goto end;
@@ -2748,7 +3101,7 @@ static bool saveGameCardSpecificData(void *userdata)
     crc = crc32Calculate(&(gc_security_information.specific_data), sizeof(GameCardSpecificData));
     snprintf(path, MAX_ELEMENTS(path), " (Specific Data) (%08X).bin", crc);
 
-    filename = generateOutputGameCardFileName("Gamecard", path, true);
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
     if (!filename) goto end;
 
     if (!saveFileData(filename, &(gc_security_information.specific_data), sizeof(GameCardSpecificData))) goto end;
@@ -2780,7 +3133,7 @@ static bool saveGameCardIdSet(void *userdata)
     crc = crc32Calculate(&id_set, sizeof(FsGameCardIdSet));
     snprintf(path, MAX_ELEMENTS(path), " (Card ID Set) (%08X).bin", crc);
 
-    filename = generateOutputGameCardFileName("Gamecard", path, true);
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
     if (!filename) goto end;
 
     if (!saveFileData(filename, &id_set, sizeof(FsGameCardIdSet))) goto end;
@@ -2810,13 +3163,13 @@ static bool saveGameCardUid(void *userdata)
         goto end;
     }
 
-    crc = crc32Calculate(gc_security_information.specific_data.card_uid, sizeof(gc_security_information.specific_data.card_uid));
+    crc = crc32Calculate(&(gc_security_information.specific_data.card_uid), sizeof(gc_security_information.specific_data.card_uid));
     snprintf(path, MAX_ELEMENTS(path), " (Card UID) (%08X).bin", crc);
 
-    filename = generateOutputGameCardFileName("Gamecard", path, true);
+    filename = generateOutputGameCardFileName(GAMECARD_SUBDIR, path, true);
     if (!filename) goto end;
 
-    if (!saveFileData(filename, gc_security_information.specific_data.card_uid, sizeof(gc_security_information.specific_data.card_uid))) goto end;
+    if (!saveFileData(filename, &(gc_security_information.specific_data.card_uid), sizeof(gc_security_information.specific_data.card_uid))) goto end;
 
     consolePrint("successfully saved gamecard uid as \"%s\"\n", filename);
     success = true;
@@ -2858,6 +3211,7 @@ end:
 static bool saveGameCardRawHfsPartition(HashFileSystemContext *hfs_ctx)
 {
     u64 free_space = 0;
+    char size_str[16] = {0};
 
     HfsThreadData hfs_thread_data = {0};
     SharedThreadData *shared_thread_data = &(hfs_thread_data.shared_thread_data);
@@ -2870,10 +3224,11 @@ static bool saveGameCardRawHfsPartition(HashFileSystemContext *hfs_ctx)
     hfs_thread_data.hfs_ctx = hfs_ctx;
     shared_thread_data->total_size = hfs_ctx->size;
 
-    consolePrint("raw %s hfs partition size: 0x%lX\n", hfs_ctx->name, hfs_ctx->size);
+    utilsGenerateFormattedSizeString((double)hfs_ctx->size, size_str, sizeof(size_str));
+    consolePrint("raw %s hfs partition size: 0x%lX (%s)\n", hfs_ctx->name, hfs_ctx->size, size_str);
 
     snprintf(path, MAX_ELEMENTS(path), "/%s.hfs0", hfs_ctx->name);
-    filename = generateOutputGameCardFileName("HFS/Raw", path, true);
+    filename = generateOutputGameCardFileName(HFS_SUBDIR "/Raw", path, true);
     if (!filename) goto end;
 
     if (dev_idx == 1)
@@ -2960,6 +3315,7 @@ end:
 static bool saveGameCardExtractedHfsPartition(HashFileSystemContext *hfs_ctx)
 {
     u64 data_size = 0;
+    char size_str[16] = {0};
 
     HfsThreadData hfs_thread_data = {0};
     SharedThreadData *shared_thread_data = &(hfs_thread_data.shared_thread_data);
@@ -2981,7 +3337,8 @@ static bool saveGameCardExtractedHfsPartition(HashFileSystemContext *hfs_ctx)
     hfs_thread_data.hfs_ctx = hfs_ctx;
     shared_thread_data->total_size = data_size;
 
-    consolePrint("extracted %s hfs partition size: 0x%lX\n", hfs_ctx->name, data_size);
+    utilsGenerateFormattedSizeString((double)data_size, size_str, sizeof(size_str));
+    consolePrint("extracted %s hfs partition size: 0x%lX (%s)\n", hfs_ctx->name, data_size, size_str);
     consoleRefresh();
 
     success = spanDumpThreads(extractedHfsReadThreadFunc, genericWriteThreadFunc, &hfs_thread_data);
@@ -3021,7 +3378,7 @@ static bool browseGameCardHfsPartition(void *userdata)
 
     /* Generate output base path. */
     snprintf(subdir, MAX_ELEMENTS(subdir), "/%s", hfs_ctx.name);
-    base_out_path = generateOutputGameCardFileName("HFS/Extracted", subdir, true);
+    base_out_path = generateOutputGameCardFileName(HFS_SUBDIR "/Extracted", subdir, true);
     if (!base_out_path) goto end;
 
     /* Display file browser. */
@@ -3050,6 +3407,8 @@ static bool saveConsoleLafwBlob(void *userdata)
 
     u64 lafw_version = 0;
     LotusAsicFirmwareBlob lafw_blob = {0};
+    LotusAsicFirmwareType fw_type = LotusAsicFirmwareType_Invalid;
+    LotusAsicDeviceType dev_type = LotusAsicDeviceType_Invalid;
     bool success = false;
     u32 crc = 0;
     char *filename = NULL;
@@ -3061,21 +3420,23 @@ static bool saveConsoleLafwBlob(void *userdata)
         goto end;
     }
 
-    fw_type_str = gamecardGetLafwTypeString(lafw_blob.fw_type);
+    fw_type = gamecardGetLafwType(&lafw_blob);
+    fw_type_str = gamecardGetLafwTypeString(fw_type);
     if (!fw_type_str) fw_type_str = "Unknown";
 
-    dev_type_str = gamecardGetLafwDeviceTypeString(lafw_blob.device_type);
+    dev_type = gamecardGetLafwDeviceType(&lafw_blob);
+    dev_type_str = gamecardGetLafwDeviceTypeString(dev_type);
     if (!dev_type_str) dev_type_str = "Unknown";
 
     consolePrint("get console lafw blob ok\n");
 
-    crc = crc32Calculate(&lafw_blob, sizeof(LotusAsicFirmwareBlob));
+    crc = crc32Calculate(&lafw_blob, sizeof(lafw_blob));
     snprintf(path, MAX_ELEMENTS(path), "LAFW (%s) (%s) (v%lu) (%08X).bin", fw_type_str, dev_type_str, lafw_version, crc);
 
     filename = generateOutputGameCardFileName(NULL, path, false);
     if (!filename) goto end;
 
-    if (!saveFileData(filename, &lafw_blob, sizeof(LotusAsicFirmwareBlob))) goto end;
+    if (!saveFileData(filename, &lafw_blob, sizeof(lafw_blob))) goto end;
 
     consolePrint("successfully saved lafw blob as \"%s\"\n", filename);
     success = true;
@@ -3108,8 +3469,8 @@ static bool saveNintendoSubmissionPackage(void *userdata)
 
     if (app_metadata)
     {
-        consolePrint("name: %s\n", app_metadata->lang_entry.name);
-        consolePrint("publisher: %s\n", app_metadata->lang_entry.author);
+        consolePrint("name: %s\n", app_metadata->name);
+        consolePrint("publisher: %s\n", app_metadata->publisher);
     }
 
     consolePrint("source storage: %s\n", titleGetNcmStorageIdName(title_info->storage_id));
@@ -3257,7 +3618,7 @@ static bool saveTicket(void *userdata)
     }
 
     /* Initialize NCA context. */
-    if (!ncaInitializeContext(nca_ctx, title_info->storage_id, (title_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : 0), \
+    if (!ncaInitializeContext(nca_ctx, title_info->storage_id, (title_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : HashFileSystemPartitionType_None), \
                               &(title_info->meta_key), content_info, &tik))
     {
         consolePrint("nca initialize ctx failed\n");
@@ -3288,7 +3649,7 @@ static bool saveTicket(void *userdata)
     crc = crc32Calculate(tik.data, tik.size);
     snprintf(path, MAX_ELEMENTS(path), " (%08X).tik", crc);
 
-    filename = generateOutputTitleFileName(title_info, "Ticket", path);
+    filename = generateOutputTitleFileName(title_info, TICKET_SUBDIR, path);
     if (!filename) goto end;
 
     if (!saveFileData(filename, tik.data, tik.size)) goto end;
@@ -3322,6 +3683,7 @@ static bool saveNintendoContentArchive(void *userdata)
     u64 free_space = 0;
     char *filename = NULL, subdir[0x20] = {0};
     u32 dev_idx = g_storageMenuElementOption.selected;
+    char size_str[16] = {0};
 
     bool success = false;
 
@@ -3333,7 +3695,7 @@ static bool saveNintendoContentArchive(void *userdata)
     }
 
     /* Initialize NCA context. */
-    if (!ncaInitializeContext(nca_thread_data.nca_ctx, title_info->storage_id, (title_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : 0), \
+    if (!ncaInitializeContext(nca_thread_data.nca_ctx, title_info->storage_id, (title_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : HashFileSystemPartitionType_None), \
                               &(title_info->meta_key), content_info, NULL))
     {
         consolePrint("nca initialize ctx failed\n");
@@ -3342,9 +3704,10 @@ static bool saveNintendoContentArchive(void *userdata)
 
     shared_thread_data->total_size = nca_thread_data.nca_ctx->content_size;
 
-    consolePrint("nca size: 0x%lX\n", shared_thread_data->total_size);
+    utilsGenerateFormattedSizeString((double)shared_thread_data->total_size, size_str, sizeof(size_str));
+    consolePrint("nca size: 0x%lX (%s)\n", shared_thread_data->total_size, size_str);
 
-    snprintf(subdir, MAX_ELEMENTS(subdir), "NCA/%s", nca_thread_data.nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
+    snprintf(subdir, MAX_ELEMENTS(subdir), NCA_SUBDIR "/%s", nca_thread_data.nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
     snprintf(path, MAX_ELEMENTS(path), "/%s.%s", nca_thread_data.nca_ctx->content_id_str, content_info->content_type == NcmContentType_Meta ? "cnmt.nca" : "nca");
 
     filename = generateOutputTitleFileName(title_info, subdir, path);
@@ -3528,7 +3891,7 @@ static bool browseNintendoContentArchiveFsSection(void *userdata)
 
         base_out_path = generateOutputLayeredFsFileName(title_id + nca_ctx->id_offset, NULL, section_type == NcaFsSectionType_PartitionFs ? "exefs" : "romfs");
     } else {
-        snprintf(subdir, MAX_ELEMENTS(subdir), "NCA FS/%s/Extracted", nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
+        snprintf(subdir, MAX_ELEMENTS(subdir), NCA_FS_SUBDIR "/%s/Extracted", nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
         snprintf(extension, MAX_ELEMENTS(extension), "/%s #%u/%u", titleGetNcmContentTypeName(nca_ctx->content_type), nca_ctx->id_offset, nca_fs_ctx->section_idx);
 
         TitleInfo *title_info = (title_id == g_ncaUserTitleInfo->meta_key.id ? g_ncaUserTitleInfo : g_ncaBasePatchTitleInfo);
@@ -3550,6 +3913,81 @@ end:
     if (romfs_ctx) romfsFreeContext(romfs_ctx);
     if (fs_ctx) free(fs_ctx);
     if (base_patch_nca_ctx) free(base_patch_nca_ctx);
+
+    if (!success && g_appletStatus)
+    {
+        consolePrint("press any button to continue\n");
+        utilsWaitForButtonPress(0);
+    }
+
+    return success;
+}
+
+static bool saveSystemUpdateDump(void *userdata)
+{
+    NX_IGNORE_ARG(userdata);
+
+    SystemUpdateDumpContext sys_upd_dump_ctx = {0};
+    SystemUpdateThreadData sys_upd_thread_data = {0};
+    SharedThreadData *shared_thread_data = &(sys_upd_thread_data.shared_thread_data);
+
+    char size_str[16] = {0};
+
+    bool success = false;
+
+    if (!systemUpdateInitializeDumpContext(&sys_upd_dump_ctx))
+    {
+        consolePrint("system update dump ctx init failed!\n");
+        goto end;
+    }
+
+    sys_upd_thread_data.sys_upd_dump_ctx = &sys_upd_dump_ctx;
+    shared_thread_data->total_size = sys_upd_dump_ctx.total_size;
+
+    utilsGenerateFormattedSizeString((double)sys_upd_dump_ctx.total_size, size_str, sizeof(size_str));
+    consolePrint("sysupd description: %.*s\nsysupd size: 0x%lX (%s)\nsysupd content count: %u\n", (int)sizeof(sys_upd_dump_ctx.version_file.display_title), \
+                                                                                                  sys_upd_dump_ctx.version_file.display_title, sys_upd_dump_ctx.total_size, \
+                                                                                                  size_str, sys_upd_dump_ctx.content_count);
+    consoleRefresh();
+
+    success = spanDumpThreads(systemUpdateReadThreadFunc, genericWriteThreadFunc, &sys_upd_thread_data);
+
+end:
+    systemUpdateFreeDumpContext(&sys_upd_dump_ctx);
+
+    return success;
+}
+
+static bool browseEmmcPartition(void *userdata)
+{
+    u8 bis_partition_id = (userdata ? *((u8*)userdata) : 0);
+    const char *gpt_name = NULL, *mount_name = NULL;
+    char *base_out_path = NULL;
+
+    bool success = false;
+
+    if (bis_partition_id < FsBisPartitionId_CalibrationFile || bis_partition_id > FsBisPartitionId_System)
+    {
+        consolePrint("invalid bis partition id! (%u)\n", bis_partition_id);
+        goto end;
+    }
+
+    if (!(gpt_name = bisStorageGetGptPartitionNameByBisPartitionId(bis_partition_id)) || !(mount_name = bisStorageGetMountNameByBisPartitionId(bis_partition_id)))
+    {
+        consolePrint("failed to get names for bis partition id! (%u)\n", bis_partition_id);
+        goto end;
+    }
+
+    /* Generate output base path. */
+    base_out_path = generateOutputGameCardFileName(utilsGetAtmosphereEmummcStatus() ? EMUMMC_SUBDIR : SYSMMC_SUBDIR, gpt_name, false);
+    if (!base_out_path) goto end;
+
+    /* Display file browser. */
+    success = fsBrowser(mount_name, base_out_path);
+
+end:
+    /* Free data. */
+    if (base_out_path) free(base_out_path);
 
     if (!success && g_appletStatus)
     {
@@ -3593,8 +4031,13 @@ static bool fsBrowser(const char *mount_name, const char *base_out_path)
         consolePrint("press + to exit\n");
         consolePrint("______________________________\n\n");
 
-        consolePrint("entry: %u / %u\n", selected + 1, entries_count);
-        consolePrint("highlighted: %u / %u\n", highlighted, entries_count);
+        if (entries_count)
+        {
+            consolePrint("entry: %u / %u\n", selected + 1, entries_count);
+            consolePrint("highlighted: %u / %u\n", highlighted, entries_count);
+            consolePrint("selected: %s\n", entries[selected].dt.d_name);
+        }
+
         consolePrint("current path: %s\n", dir_path);
         consolePrint("______________________________\n\n");
 
@@ -3849,6 +4292,9 @@ static bool fsBrowserGetDirEntries(const char *dir_path, FsBrowserEntry **out_en
         goto end;
     }
 
+    /* Sort entries. */
+    if (count > 1) qsort(entries, count, sizeof(FsBrowserEntry), &fsBrowserDirEntrySortFunction);
+
     /* Update output pointers. */
     *out_entries = entries;
     *out_entry_count = count;
@@ -3862,6 +4308,23 @@ end:
     if (!success && entries) free(entries);
 
     return success;
+}
+
+static int fsBrowserDirEntrySortFunction(const void *a, const void *b)
+{
+    const FsBrowserEntry *entry_1 = (const FsBrowserEntry*)a;
+    const FsBrowserEntry *entry_2 = (const FsBrowserEntry*)b;
+
+    if (entry_1->dt.d_type < entry_2->dt.d_type)
+    {
+        return -1;
+    } else
+    if (entry_1->dt.d_type > entry_2->dt.d_type)
+    {
+        return 1;
+    }
+
+    return strcasecmp(entry_1->dt.d_name, entry_2->dt.d_name);
 }
 
 static bool fsBrowserDumpFile(const char *dir_path, const FsBrowserEntry *entry, const char *base_out_path)
@@ -3881,7 +4344,7 @@ static bool fsBrowserDumpFile(const char *dir_path, const FsBrowserEntry *entry,
 
     consoleClear();
     consolePrint("file path: %s\n", path);
-    consolePrint("file size: 0x%lX\n\n", entry->size);
+    consolePrint("file size: 0x%lX (%s)\n\n", entry->size, entry->size_str);
 
     /* Open input file. */
     fs_browser_thread_data.src = fopen(path, "rb");
@@ -3991,6 +4454,7 @@ static bool fsBrowserDumpHighlightedEntries(const char *dir_path, const FsBrowse
 {
     bool append_path_sep = (dir_path[strlen(dir_path) - 1] != '/');
     u64 data_size = 0;
+    char size_str[16] = {0};
 
     FsBrowserHighlightedEntriesThreadData fs_browser_thread_data = {0};
     SharedThreadData *shared_thread_data = &(fs_browser_thread_data.shared_thread_data);
@@ -4033,7 +4497,8 @@ static bool fsBrowserDumpHighlightedEntries(const char *dir_path, const FsBrowse
     fs_browser_thread_data.base_out_path = base_out_path;
     shared_thread_data->total_size = data_size;
 
-    consolePrint("dump size: 0x%lX\n", data_size);
+    utilsGenerateFormattedSizeString((double)data_size, size_str, sizeof(size_str));
+    consolePrint("dump size: 0x%lX (%s)\n", data_size, size_str);
     consoleRefresh();
 
     success = spanDumpThreads(fsBrowserHighlightedEntriesReadThreadFunc, genericWriteThreadFunc, &fs_browser_thread_data);
@@ -4112,7 +4577,7 @@ static bool initializeNcaFsContext(void *userdata, u8 *out_section_type, bool *o
             goto end;
         }
 
-        if (!ncaInitializeContext(base_patch_nca_ctx, g_ncaBasePatchTitleInfo->storage_id, (g_ncaBasePatchTitleInfo->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : 0), \
+        if (!ncaInitializeContext(base_patch_nca_ctx, g_ncaBasePatchTitleInfo->storage_id, (g_ncaBasePatchTitleInfo->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : HashFileSystemPartitionType_None), \
                                   &(g_ncaBasePatchTitleInfo->meta_key), base_patch_content_info, NULL))
         {
             consolePrint("failed to initialize base/patch nca ctx!\n");
@@ -4183,6 +4648,7 @@ end:
 static bool saveRawPartitionFsSection(PartitionFileSystemContext *pfs_ctx, bool use_layeredfs_dir)
 {
     u64 free_space = 0;
+    char size_str[16] = {0};
 
     PfsThreadData pfs_thread_data = {0};
     SharedThreadData *shared_thread_data = &(pfs_thread_data.shared_thread_data);
@@ -4202,7 +4668,8 @@ static bool saveRawPartitionFsSection(PartitionFileSystemContext *pfs_ctx, bool 
     pfs_thread_data.use_layeredfs_dir = use_layeredfs_dir;
     shared_thread_data->total_size = pfs_ctx->size;
 
-    consolePrint("raw partitionfs section size: 0x%lX\n", pfs_ctx->size);
+    utilsGenerateFormattedSizeString((double)pfs_ctx->size, size_str, sizeof(size_str));
+    consolePrint("raw partitionfs section size: 0x%lX (%s)\n", pfs_ctx->size, size_str);
 
     if (use_layeredfs_dir)
     {
@@ -4212,7 +4679,7 @@ static bool saveRawPartitionFsSection(PartitionFileSystemContext *pfs_ctx, bool 
 
         filename = generateOutputLayeredFsFileName(title_id + nca_ctx->id_offset, NULL, "exefs.nsp");
     } else {
-        snprintf(subdir, MAX_ELEMENTS(subdir), "NCA FS/%s/Raw", nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
+        snprintf(subdir, MAX_ELEMENTS(subdir), NCA_FS_SUBDIR "/%s/Raw", nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
         snprintf(path, MAX_ELEMENTS(path), "/%s #%u/%u.nsp", titleGetNcmContentTypeName(nca_ctx->content_type), nca_ctx->id_offset, nca_fs_ctx->section_idx);
 
         TitleInfo *title_info = (title_id == g_ncaUserTitleInfo->meta_key.id ? g_ncaUserTitleInfo : g_ncaBasePatchTitleInfo);
@@ -4305,6 +4772,7 @@ end:
 static bool saveExtractedPartitionFsSection(PartitionFileSystemContext *pfs_ctx, bool use_layeredfs_dir)
 {
     u64 data_size = 0;
+    char size_str[16] = {0};
 
     PfsThreadData pfs_thread_data = {0};
     SharedThreadData *shared_thread_data = &(pfs_thread_data.shared_thread_data);
@@ -4327,7 +4795,8 @@ static bool saveExtractedPartitionFsSection(PartitionFileSystemContext *pfs_ctx,
     pfs_thread_data.use_layeredfs_dir = use_layeredfs_dir;
     shared_thread_data->total_size = data_size;
 
-    consolePrint("extracted partitionfs section size: 0x%lX\n", data_size);
+    utilsGenerateFormattedSizeString((double)data_size, size_str, sizeof(size_str));
+    consolePrint("extracted partitionfs section size: 0x%lX (%s)\n", data_size, size_str);
     consoleRefresh();
 
     success = spanDumpThreads(extractedPartitionFsReadThreadFunc, genericWriteThreadFunc, &pfs_thread_data);
@@ -4339,6 +4808,7 @@ end:
 static bool saveRawRomFsSection(RomFileSystemContext *romfs_ctx, bool use_layeredfs_dir)
 {
     u64 free_space = 0;
+    char size_str[16] = {0};
 
     RomFsThreadData romfs_thread_data = {0};
     SharedThreadData *shared_thread_data = &(romfs_thread_data.shared_thread_data);
@@ -4358,7 +4828,8 @@ static bool saveRawRomFsSection(RomFileSystemContext *romfs_ctx, bool use_layere
     romfs_thread_data.use_layeredfs_dir = use_layeredfs_dir;
     shared_thread_data->total_size = romfs_ctx->size;
 
-    consolePrint("raw romfs section size: 0x%lX\n", romfs_ctx->size);
+    utilsGenerateFormattedSizeString((double)romfs_ctx->size, size_str, sizeof(size_str));
+    consolePrint("raw romfs section size: 0x%lX (%s)\n", romfs_ctx->size, size_str);
 
     if (use_layeredfs_dir)
     {
@@ -4368,7 +4839,7 @@ static bool saveRawRomFsSection(RomFileSystemContext *romfs_ctx, bool use_layere
 
         filename = generateOutputLayeredFsFileName(title_id + nca_ctx->id_offset, NULL, "romfs.bin");
     } else {
-        snprintf(subdir, MAX_ELEMENTS(subdir), "NCA FS/%s/Raw", nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
+        snprintf(subdir, MAX_ELEMENTS(subdir), NCA_FS_SUBDIR "/%s/Raw", nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
         snprintf(path, MAX_ELEMENTS(path), "/%s #%u/%u.bin", titleGetNcmContentTypeName(nca_ctx->content_type), nca_ctx->id_offset, nca_fs_ctx->section_idx);
 
         TitleInfo *title_info = (title_id == g_ncaUserTitleInfo->meta_key.id ? g_ncaUserTitleInfo : g_ncaBasePatchTitleInfo);
@@ -4461,6 +4932,7 @@ end:
 static bool saveExtractedRomFsSection(RomFileSystemContext *romfs_ctx, bool use_layeredfs_dir)
 {
     u64 data_size = 0;
+    char size_str[16] = {0};
 
     RomFsThreadData romfs_thread_data = {0};
     SharedThreadData *shared_thread_data = &(romfs_thread_data.shared_thread_data);
@@ -4483,7 +4955,8 @@ static bool saveExtractedRomFsSection(RomFileSystemContext *romfs_ctx, bool use_
     romfs_thread_data.use_layeredfs_dir = use_layeredfs_dir;
     shared_thread_data->total_size = data_size;
 
-    consolePrint("extracted romfs section size: 0x%lX\n", data_size);
+    utilsGenerateFormattedSizeString((double)data_size, size_str, sizeof(size_str));
+    consolePrint("extracted romfs section size: 0x%lX (%s)\n", data_size, size_str);
     consoleRefresh();
 
     success = spanDumpThreads(extractedRomFsReadThreadFunc, genericWriteThreadFunc, &romfs_thread_data);
@@ -4514,6 +4987,8 @@ static void xciReadThreadFunc(void *arg)
     bool keep_certificate = (bool)getGameCardKeepCertificateOption();
     bool calculate_checksum = (bool)getGameCardCalculateChecksumOption();
 
+    size_t cert_size = GAMECARD_CERT_SIZE(xci_thread_data->is_t2);
+
     for(u64 offset = 0, blksize = BLOCK_SIZE; offset < shared_thread_data->total_size; offset += blksize)
     {
         if (blksize > (shared_thread_data->total_size - offset)) blksize = (shared_thread_data->total_size - offset);
@@ -4534,7 +5009,7 @@ static void xciReadThreadFunc(void *arg)
         }
 
         /* Remove certificate */
-        if (!keep_certificate && offset == 0) memset((u8*)buf1 + GAMECARD_CERT_OFFSET, 0xFF, sizeof(FsGameCardCertificate));
+        if (!keep_certificate && offset == 0) memset((u8*)buf1 + GAMECARD_CERT_OFFSET, 0xFF, cert_size);
 
         /* Update checksum */
         if (calculate_checksum)
@@ -4665,7 +5140,7 @@ static void extractedHfsReadThreadFunc(void *arg)
     buf2 = usbAllocatePageAlignedBuffer(BLOCK_SIZE);
 
     snprintf(hfs_path, MAX_ELEMENTS(hfs_path), "/%s", hfs_ctx->name);
-    filename = generateOutputGameCardFileName("HFS/Extracted", hfs_path, true);
+    filename = generateOutputGameCardFileName(HFS_SUBDIR "/Extracted", hfs_path, true);
     filename_len = (filename ? strlen(filename) : 0);
 
     if (!shared_thread_data->total_size || !hfs_entry_count || !buf1 || !buf2 || !filename)
@@ -5047,7 +5522,7 @@ static void extractedPartitionFsReadThreadFunc(void *arg)
 
         filename = generateOutputLayeredFsFileName(title_id + nca_ctx->id_offset, NULL, "exefs");
     } else {
-        snprintf(subdir, MAX_ELEMENTS(subdir), "NCA FS/%s/Extracted", nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
+        snprintf(subdir, MAX_ELEMENTS(subdir), NCA_FS_SUBDIR "/%s/Extracted", nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
         snprintf(pfs_path, MAX_ELEMENTS(pfs_path), "/%s #%u/%u", titleGetNcmContentTypeName(nca_ctx->content_type), nca_ctx->id_offset, nca_fs_ctx->section_idx);
 
         TitleInfo *title_info = (title_id == g_ncaUserTitleInfo->meta_key.id ? g_ncaUserTitleInfo : g_ncaBasePatchTitleInfo);
@@ -5365,7 +5840,7 @@ static void extractedRomFsReadThreadFunc(void *arg)
 
         filename = generateOutputLayeredFsFileName(title_id + nca_ctx->id_offset, NULL, "romfs");
     } else {
-        snprintf(subdir, MAX_ELEMENTS(subdir), "NCA FS/%s/Extracted", nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
+        snprintf(subdir, MAX_ELEMENTS(subdir), NCA_FS_SUBDIR "/%s/Extracted", nca_ctx->storage_id == NcmStorageId_BuiltInSystem ? "System" : "User");
         snprintf(romfs_path, MAX_ELEMENTS(romfs_path), "/%s #%u/%u", titleGetNcmContentTypeName(nca_ctx->content_type), nca_ctx->id_offset, nca_fs_ctx->section_idx);
 
         TitleInfo *title_info = (title_id == g_ncaUserTitleInfo->meta_key.id ? g_ncaUserTitleInfo : g_ncaBasePatchTitleInfo);
@@ -5940,6 +6415,255 @@ end:
     return !shared_thread_data->read_error;
 }
 
+static void systemUpdateReadThreadFunc(void *arg)
+{
+    void *buf1 = NULL, *buf2 = NULL;
+    SystemUpdateThreadData *sys_upd_thread_data = (SystemUpdateThreadData*)arg;
+    SharedThreadData *shared_thread_data = &(sys_upd_thread_data->shared_thread_data);
+
+    SystemUpdateDumpContext *sys_upd_dump_ctx = sys_upd_thread_data->sys_upd_dump_ctx;
+
+    char sys_upd_path[FS_MAX_PATH] = {0}, *filename = NULL;
+    size_t filename_len = 0;
+
+    u64 free_space = 0;
+    u32 dev_idx = g_storageMenuElementOption.selected;
+
+    u64 nca_filesize = 0;
+    char *nca_filename = NULL;
+
+    buf1 = usbAllocatePageAlignedBuffer(BLOCK_SIZE);
+    buf2 = usbAllocatePageAlignedBuffer(BLOCK_SIZE);
+
+    snprintf(sys_upd_path, MAX_ELEMENTS(sys_upd_path), "/%.*s (%s)", (int)sizeof(sys_upd_dump_ctx->version_file.display_title),
+                                                                     sys_upd_dump_ctx->version_file.display_title, utilsIsDevelopmentUnit() ? "Dev" : "Prod");
+    filename = generateOutputGameCardFileName(SYSTEM_UPDATE_SUBDIR, sys_upd_path, false);
+    filename_len = (filename ? strlen(filename) : 0);
+
+    if (!shared_thread_data->total_size || !buf1 || !buf2 || !filename)
+    {
+        shared_thread_data->read_error = true;
+        goto end;
+    }
+
+    utilsReplaceIllegalCharacters(strrchr(filename, '/') + 1, dev_idx == 0);
+
+    if (dev_idx != 1)
+    {
+        if (!utilsGetFileSystemStatsByPath(filename, NULL, &free_space))
+        {
+            consolePrint("failed to retrieve free space from selected device\n");
+            shared_thread_data->read_error = true;
+        }
+
+        if (!shared_thread_data->read_error && shared_thread_data->total_size >= free_space)
+        {
+            consolePrint("dump size exceeds free space\n");
+            shared_thread_data->read_error = true;
+        }
+    } else {
+        if (!usbStartExtractedFsDump(shared_thread_data->total_size, filename))
+        {
+            consolePrint("failed to send extracted fs info to host\n");
+            shared_thread_data->read_error = true;
+        }
+    }
+
+    if (shared_thread_data->read_error)
+    {
+        condvarWakeAll(&g_writeCondvar);
+        goto end;
+    }
+
+    /* Loop through all file entries. */
+    while(sys_upd_dump_ctx->content_idx < sys_upd_dump_ctx->content_count)
+    {
+        if (nca_filename)
+        {
+            free(nca_filename);
+            nca_filename = NULL;
+        }
+
+        /* Check if the transfer has been cancelled by the user. */
+        if (shared_thread_data->transfer_cancelled)
+        {
+            condvarWakeAll(&g_writeCondvar);
+            break;
+        }
+
+        if (dev_idx != 1)
+        {
+            /* Wait until the previous data chunk has been written */
+            mutexLock(&g_fileMutex);
+            if (shared_thread_data->data_size && !shared_thread_data->write_error) condvarWait(&g_readCondvar, &g_fileMutex);
+            mutexUnlock(&g_fileMutex);
+
+            if (shared_thread_data->write_error) break;
+
+            /* Close file. */
+            if (shared_thread_data->fp)
+            {
+                fclose(shared_thread_data->fp);
+                shared_thread_data->fp = NULL;
+                if (dev_idx == 0) utilsCommitSdCardFileSystemChanges();
+            }
+        }
+
+        /* Retrieve system update content file information. */
+        shared_thread_data->read_error = (!systemUpdateGetCurrentContentFileSizeFromDumpContext(sys_upd_dump_ctx, &nca_filesize) || !nca_filesize || \
+                                          !(nca_filename = systemUpdateGetCurrentContentFileNameFromDumpContext(sys_upd_dump_ctx)));
+        if (shared_thread_data->read_error)
+        {
+            condvarWakeAll(&g_writeCondvar);
+            break;
+        }
+
+        /* Generate output path. */
+        snprintf(sys_upd_path, MAX_ELEMENTS(sys_upd_path), "%s/%s", filename, nca_filename);
+        utilsReplaceIllegalCharacters(sys_upd_path + filename_len + 1, dev_idx == 0);
+
+        if (dev_idx == 1)
+        {
+            /* Wait until the previous data chunk has been written */
+            mutexLock(&g_fileMutex);
+            if (shared_thread_data->data_size && !shared_thread_data->write_error) condvarWait(&g_readCondvar, &g_fileMutex);
+            mutexUnlock(&g_fileMutex);
+
+            if (shared_thread_data->write_error) break;
+
+            /* Send current file properties */
+            shared_thread_data->read_error = !usbSendFileProperties(nca_filesize, sys_upd_path);
+        } else {
+            /* Create directory tree. */
+            utilsCreateDirectoryTree(sys_upd_path, false);
+
+            if (dev_idx == 0)
+            {
+                /* Create ConcatenationFile if we're dealing with a big file + SD card as the output storage. */
+                if (nca_filesize > FAT32_FILESIZE_LIMIT && !utilsCreateConcatenationFile(sys_upd_path))
+                {
+                    consolePrint("failed to create concatenation file for \"%s\"!\n", sys_upd_path);
+                    shared_thread_data->read_error = true;
+                }
+            } else {
+                /* Don't handle file chunks on FAT12/FAT16/FAT32 formatted UMS devices. */
+                if (g_umsDevices[dev_idx - 2].fs_type < UsbHsFsDeviceFileSystemType_exFAT && nca_filesize > FAT32_FILESIZE_LIMIT)
+                {
+                    consolePrint("split dumps not supported for FAT12/16/32 volumes in UMS devices (yet)\n");
+                    shared_thread_data->read_error = true;
+                }
+            }
+
+            if (!shared_thread_data->read_error)
+            {
+                /* Open output file. */
+                shared_thread_data->read_error = ((shared_thread_data->fp = fopen(sys_upd_path, "wb")) == NULL);
+                if (!shared_thread_data->read_error)
+                {
+                    /* Set file size. */
+                    setvbuf(shared_thread_data->fp, NULL, _IONBF, 0);
+                    ftruncate(fileno(shared_thread_data->fp), (off_t)nca_filesize);
+                } else {
+                    consolePrint("failed to open \"%s\" for writing!\n", sys_upd_path);
+                }
+            }
+        }
+
+        if (shared_thread_data->read_error)
+        {
+            condvarWakeAll(&g_writeCondvar);
+            break;
+        }
+
+        for(u64 offset = 0, blksize = BLOCK_SIZE; offset < nca_filesize; offset += blksize)
+        {
+            if (blksize > (nca_filesize - offset)) blksize = (nca_filesize - offset);
+
+            /* Check if the transfer has been cancelled by the user. */
+            if (shared_thread_data->transfer_cancelled)
+            {
+                condvarWakeAll(&g_writeCondvar);
+                break;
+            }
+
+            /* Read current file data chunk. */
+            shared_thread_data->read_error = !systemUpdateReadCurrentContentFileFromDumpContext(sys_upd_dump_ctx, buf1, blksize);
+            if (shared_thread_data->read_error)
+            {
+                condvarWakeAll(&g_writeCondvar);
+                break;
+            }
+
+            /* Wait until the previous file data chunk has been written. */
+            mutexLock(&g_fileMutex);
+
+            if (shared_thread_data->data_size && !shared_thread_data->write_error) condvarWait(&g_readCondvar, &g_fileMutex);
+
+            if (shared_thread_data->write_error)
+            {
+                mutexUnlock(&g_fileMutex);
+                break;
+            }
+
+            /* Update shared object. */
+            shared_thread_data->data = buf1;
+            shared_thread_data->data_size = blksize;
+
+            /* Swap buffers. */
+            buf1 = buf2;
+            buf2 = shared_thread_data->data;
+
+            /* Wake up the write thread to continue writing data. */
+            mutexUnlock(&g_fileMutex);
+            condvarWakeAll(&g_writeCondvar);
+        }
+
+        if (shared_thread_data->read_error || shared_thread_data->write_error || shared_thread_data->transfer_cancelled) break;
+    }
+
+    if (!shared_thread_data->read_error && !shared_thread_data->write_error && !shared_thread_data->transfer_cancelled)
+    {
+        /* Wait until the previous file data chunk has been written. */
+        mutexLock(&g_fileMutex);
+        if (shared_thread_data->data_size) condvarWait(&g_readCondvar, &g_fileMutex);
+        mutexUnlock(&g_fileMutex);
+
+        if (dev_idx == 1) usbEndExtractedFsDump();
+
+        shared_thread_data->read_error = !systemUpdateIsDumpContextFinished(sys_upd_dump_ctx);
+        if (!shared_thread_data->read_error)
+        {
+            consolePrint("successfully saved system update data to \"%s\"\n", filename);
+        } else {
+            consolePrint("unexpected sys upd dump ctx error\n");
+        }
+
+        consoleRefresh();
+    }
+
+end:
+    if (shared_thread_data->fp)
+    {
+        fclose(shared_thread_data->fp);
+        shared_thread_data->fp = NULL;
+
+        if ((shared_thread_data->read_error || shared_thread_data->write_error || shared_thread_data->transfer_cancelled) && dev_idx != 1)
+        {
+            utilsDeleteDirectoryRecursively(filename);
+            if (dev_idx == 0) utilsCommitSdCardFileSystemChanges();
+        }
+    }
+
+    if (nca_filename) free(nca_filename);
+
+    if (filename) free(filename);
+
+    if (buf2) free(buf2);
+    if (buf1) free(buf1);
+
+    threadExit();
+}
+
 static void genericWriteThreadFunc(void *arg)
 {
     SharedThreadData *shared_thread_data = (SharedThreadData*)arg; // UB but we don't care
@@ -6131,6 +6855,7 @@ static void nspThreadFunc(void *arg)
 
     char entry_name[64] = {0};
     u64 nsp_header_size = 0, nsp_size = 0, nsp_offset = 0;
+    char size_str[16] = {0};
     char *tmp_name = NULL;
 
     Sha256Context clean_sha256_ctx = {0}, dirty_sha256_ctx = {0};
@@ -6146,7 +6871,7 @@ static void nspThreadFunc(void *arg)
     }
 
     /* Generate output path. */
-    filename = generateOutputTitleFileName(title_info, "NSP", ".nsp");
+    filename = generateOutputTitleFileName(title_info, NSP_SUBDIR, ".nsp");
     if (!filename) goto end;
 
     /* Get free space on output storage. */
@@ -6198,7 +6923,7 @@ static void nspThreadFunc(void *arg)
     // set meta nca as the last nca
     meta_nca_ctx = &(nca_ctx[title_info->content_count - 1]);
 
-    if (!ncaInitializeContext(meta_nca_ctx, title_info->storage_id, (title_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : 0), \
+    if (!ncaInitializeContext(meta_nca_ctx, title_info->storage_id, (title_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : HashFileSystemPartitionType_None), \
                               &(title_info->meta_key), titleGetContentInfoByTypeAndIdOffset(title_info, NcmContentType_Meta, 0), &tik))
     {
         consolePrint("meta nca initialize ctx failed\n");
@@ -6226,7 +6951,7 @@ static void nspThreadFunc(void *arg)
         if (content_info->content_type == NcmContentType_Meta) continue;
 
         NcaContext *cur_nca_ctx = &(nca_ctx[j]);
-        if (!ncaInitializeContext(cur_nca_ctx, title_info->storage_id, (title_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : 0), \
+        if (!ncaInitializeContext(cur_nca_ctx, title_info->storage_id, (title_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : HashFileSystemPartitionType_None), \
                                   &(title_info->meta_key), content_info, &tik))
         {
             consolePrint("%s #%u initialize nca ctx failed\n", titleGetNcmContentTypeName(content_info->content_type), content_info->id_offset);
@@ -6515,7 +7240,13 @@ static void nspThreadFunc(void *arg)
     }
 
     nsp_size = (nsp_header_size + pfs_img_ctx.fs_size);
-    consolePrint("nsp header size: 0x%lX | nsp size: 0x%lX\n", nsp_header_size, nsp_size);
+
+    utilsGenerateFormattedSizeString((double)nsp_header_size, size_str, sizeof(size_str));
+    consolePrint("nsp header size: 0x%lX (%s)\n", nsp_header_size, size_str);
+
+    utilsGenerateFormattedSizeString((double)nsp_size, size_str, sizeof(size_str));
+    consolePrint("nsp size: 0x%lX (%s)\n", nsp_size, size_str);
+
     consoleRefresh();
 
     if (dev_idx == 1)
@@ -6627,7 +7358,7 @@ static void nspThreadFunc(void *arg)
                 // validate clean hash
                 if (!cnmtVerifyContentHash(&cnmt_ctx, cur_nca_ctx, clean_sha256_hash))
                 {
-                    consolePrint("sha256 checksum mismatch for nca \"%s\"\n", cur_nca_ctx->content_id_str);
+                    consolePrint("sha256 checksum mismatch for nca \"%s\"\nplease check for corrupted data using the data management menu\n", cur_nca_ctx->content_id_str);
                     goto end;
                 }
             }
@@ -7105,4 +7836,68 @@ static u32 getNcaFsUseLayeredFsDirOption(void)
 static void setNcaFsUseLayeredFsDirOption(u32 idx)
 {
     configSetBoolean("nca_fs/use_layeredfs_dir", (bool)idx);
+}
+
+static bool resetSettings(void *userdata)
+{
+    NX_IGNORE_ARG(userdata);
+
+    consolePrint("are you sure you want to reset all settings to their default values?\n");
+    consolePrint("press a to proceed, or b to cancel\n\n");
+
+    u64 btn_down = utilsWaitForButtonPress(HidNpadButton_A | HidNpadButton_B);
+    if (btn_down & HidNpadButton_A)
+    {
+        configResetSettings();
+
+        MenuElement **element_lists[] = {
+            g_xciMenuElements,
+            g_gameCardHfsDumpMenuElements,
+            g_nspMenuElements,
+            g_ticketMenuElements,
+            g_ncaFsSectionsSubMenuElements,
+            NULL
+        };
+
+        for(u32 i = 0; element_lists[i] != NULL; i++)
+        {
+            MenuElement **cur_element_list = element_lists[i];
+            for(u32 j = 0; cur_element_list[j] != NULL; j++)
+            {
+                MenuElement *cur_element = cur_element_list[j];
+
+                MenuElementOption *cur_options = cur_element->element_options;
+                if (!cur_options) continue;
+
+                cur_options->retrieved = false;
+
+                if (cur_options->getter_func)
+                {
+                    cur_options->selected = cur_options->getter_func();
+                    cur_options->retrieved = true;
+                }
+            }
+        }
+
+        consolePrint("settings successfully reset\n");
+    }
+
+    return false;
+}
+
+static bool wipeLocalTitleCache(void *userdata)
+{
+    NX_IGNORE_ARG(userdata);
+
+    consolePrint("are you sure you want to wipe the local title cache?\n");
+    consolePrint("press a to proceed, or b to cancel\n\n");
+
+    u64 btn_down = utilsWaitForButtonPress(HidNpadButton_A | HidNpadButton_B);
+    if (btn_down & HidNpadButton_A)
+    {
+        titleWipeLocalCache();
+        consolePrint("local title cache successfully wiped\nplease reload the application to regenerate the title cache\n");
+    }
+
+    return false;
 }

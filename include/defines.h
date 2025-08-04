@@ -68,6 +68,7 @@
 #define BOOT_SYSMODULE_TID              (u64)0x0100000000000005
 #define SPL_SYSMODULE_TID               (u64)0x0100000000000028
 #define ES_SYSMODULE_TID                (u64)0x0100000000000033
+#define SYSTEM_VERSION_TID              (u64)0x0100000000000809
 #define SYSTEM_UPDATE_TID               (u64)0x0100000000000816
 #define QLAUNCH_TID                     (u64)0x0100000000001000
 
@@ -88,6 +89,9 @@
 #define TICKET_SUBDIR                   "Ticket"
 #define NCA_SUBDIR                      "NCA"
 #define NCA_FS_SUBDIR                   "NCA FS"
+#define SYSMMC_SUBDIR                   "sysMMC"
+#define EMUMMC_SUBDIR                   "emuMMC"
+#define SYSTEM_UPDATE_SUBDIR            "System Update"
 
 #define CONFIG_FILE_NAME                APP_TITLE "_config.json"
 #define DEFAULT_CONFIG_PATH             "romfs:/default_config.json"
@@ -103,7 +107,7 @@
 #define LOG_BUF_SIZE                    0x400000                                                        /* 4 MiB. */
 #define LOG_FORCE_FLUSH                 0                                                               /* Forces a log buffer flush each time the logfile is written to. */
 
-#define BIS_SYSTEM_PARTITION_MOUNT_NAME "sys:"
+#define BIS_FAT_PARTITION_COUNT         4
 
 /// Reference: https://docs.microsoft.com/en-us/windows/win32/fileio/filesystem-functionality-comparison#limits.
 /// Reference: https://en.wikipedia.org/wiki/Comparison_of_file_systems#Limits.

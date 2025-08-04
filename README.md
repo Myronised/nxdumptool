@@ -22,7 +22,7 @@ Currently planned changes for this branch include:
 * Plaintext [gamecard CardInfo area](https://switchbrew.org/wiki/XCI#CardHeaderEncryptedData) dumps. :white_check_mark:
 * [Gamecard InitialData](https://switchbrew.org/wiki/XCI#InitialData) area dumps. :white_check_mark:
 * [Gamecard CardIdSet](https://switchbrew.org/wiki/Filesystem_services#GameCardIdSet) dumps. :white_check_mark:
-* [Gamecard Hash FS partition](https://switchbrew.org/wiki/XCI#PartitionFs) dumps (in both extracted and raw inage forms). :white_check_mark:
+* [Gamecard Hash FS partition](https://switchbrew.org/wiki/XCI#PartitionFs) dumps (in both extracted and raw image forms). :white_check_mark:
 * [Lotus ASIC firmware (LAFW) blob](https://switchbrew.org/wiki/Lotus3#User_firmware) dumping from RAM. :white_check_mark:
 * Properly detect if an inserted gamecard requires a LAFW update. :white_check_mark:
 * Nintendo Submission Package (NSP) dumps for both digital and gamecard-based titles.
@@ -36,9 +36,9 @@ Currently planned changes for this branch include:
 * Improved support for multigame gamecards and titles with more than one Program NCA (e.g. SM3DAS). :white_check_mark:
 * Control.nacp patching while dumping NSPs (lets you patch screenshot, video, user account and HDCP restrictions). :white_check_mark:
 * Partition FS / Hash FS / RomFS browser using custom devoptab wrappers. :white_check_mark:
-* Full system update dumps. :x:
+* Full system update dumps with checksum and signature verification. :white_check_mark:
+* `FsStorage` + `FatFs` based eMMC browser using a custom devoptab wrapper (allows copying files protected by the FS sysmodule at runtime). :white_check_mark:
 * Batch NSP dumps. :x:
-* `FsFileSystem` + `FatFs` based eMMC browser using a custom devoptab wrapper (allows copying files protected by the FS sysmodule at runtime). :x:
 * New UI using a [customized borealis fork](https://github.com/DarkMatterCore/borealis/tree/nxdumptool-legacy). :warning:
 
 Legend:
